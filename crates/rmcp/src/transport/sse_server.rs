@@ -194,12 +194,27 @@ impl Stream for SseServerTransport {
     }
 }
 
-#[derive(Debug, Clone)]
+pub type MiddlewareFn = Box<dyn Fn(Router) -> Router + Send + Sync>;
+
+#[derive(Clone)]
 pub struct SseServerConfig {
     pub bind: SocketAddr,
     pub sse_path: String,
     pub post_path: String,
     pub ct: CancellationToken,
+    pub middlewares: Option<Arc<Vec<MiddlewareFn>>>,
+}
+
+impl std::fmt::Debug for SseServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SseServerConfig")
+            .field("bind", &self.bind)
+            .field("sse_path", &self.sse_path)
+            .field("post_path", &self.post_path)
+            .field("ct", &"<CancellationToken>")
+            .field("middlewares", &"<middleware omitted>")
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -215,16 +230,26 @@ impl SseServer {
             sse_path: "/sse".to_string(),
             post_path: "/message".to_string(),
             ct: CancellationToken::new(),
+            middlewares: None,
         })
         .await
     }
     pub async fn serve_with_config(config: SseServerConfig) -> io::Result<Self> {
         let (app, transport_rx) = App::new(config.post_path.clone());
         let listener = tokio::net::TcpListener::bind(config.bind).await?;
-        let service = Router::new()
-            .route(&config.sse_path, get(sse_handler))
-            .route(&config.post_path, post(post_event_handler))
-            .with_state(app);
+        let service = {
+            let mut router = Router::new()
+                .route(&config.sse_path, get(sse_handler))
+                .route(&config.post_path, post(post_event_handler))
+                .with_state(app);
+            if let Some(middlewares) = &config.middlewares {
+                for middleware in middlewares.iter() {
+                    router = middleware(router);
+                }
+            }
+            router
+        };
+
         let ct = config.ct.child_token();
         let server = axum::serve(listener, service).with_graceful_shutdown(async move {
             ct.cancelled().await;
