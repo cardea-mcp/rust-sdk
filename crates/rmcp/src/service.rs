@@ -515,9 +515,10 @@ where
                     if let Some(m) = m {
                         Event::PeerMessage(m.into_message())
                     } else {
-                        // input stream closed
-                        tracing::info!("input stream terminated");
-                        break QuitReason::Closed
+                        // tracing::info!("input stream terminated");
+                        // break QuitReason::Closed
+                        tracing::info!("Input stream unrecognized, but connection remains alive");
+                        continue
                     }
                 }
                 m = peer_proxy.recv() => {
