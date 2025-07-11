@@ -17,3 +17,5 @@ pub mod client_side_sse;
 #[cfg(feature = "auth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
 pub mod auth;
+
+pub mod tmcp;

@@ -22,3 +22,6 @@ categories = [
     "asynchronous",
 ]
 readme = "README.md"
+
+[patch.crates-io]
+askar-storage = { git = "https://github.com/openwallet-foundation/askar.git", rev = "0b919bb5" }
