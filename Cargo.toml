@@ -1,10 +1,9 @@
-
-
 [workspace]
 members = ["crates/rmcp", "crates/rmcp-macros", "examples/*"]
 resolver = "2"
 
 [workspace.dependencies]
+tsp_sdk = { git = "https://github.com/openwallet-foundation-labs/tsp.git"}
 rmcp = { version = "0.6.0", path = "./crates/rmcp" }
 rmcp-macros = { version = "0.6.0", path = "./crates/rmcp-macros" }
 

@@ -112,6 +112,7 @@ pin_project_lite::pin_project! {
         last_event_id: Option<String>,
         server_retry_interval: Option<Duration>,
         connector: R,
+        tmcp_connection: Option<crate::transport::common::tmcp::TmcpConnection>,
         #[pin]
         state: SseAutoReconnectStreamState<R::Future>,
     }
@@ -122,12 +123,14 @@ impl<R: SseStreamReconnect> SseAutoReconnectStream<R> {
         stream: BoxedSseResponse,
         connector: R,
         retry_policy: Arc<dyn SseRetryPolicy>,
+        tmcp_connection: Option<crate::transport::common::tmcp::TmcpConnection>,
     ) -> Self {
         Self {
             retry_policy,
             last_event_id: None,
             server_retry_interval: None,
             connector,
+            tmcp_connection,
             state: SseAutoReconnectStreamState::Connected { stream },
         }
     }
@@ -143,6 +146,7 @@ impl<E: std::error::Error + Send> SseAutoReconnectStream<NeverReconnect<E>> {
             connector: NeverReconnect {
                 error: Some(error_when_reconnect),
             },
+            tmcp_connection: None,
             state: SseAutoReconnectStreamState::Connected { stream },
         }
     }
@@ -193,16 +197,52 @@ where
                             *this.last_event_id = Some(event_id);
                         }
                         if let Some(data) = sse.data {
-                            match serde_json::from_str::<ServerJsonRpcMessage>(&data) {
+                            let try_message = if let Some(conn) = &this.tmcp_connection {
+                                match conn.open_message(&data) {
+                                    Ok(decoded) => {
+                                        tracing::debug!("client_side_sse: decoded = {}", decoded);
+                                        serde_json::from_str::<ServerJsonRpcMessage>(&decoded)
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("client_side_sse: decode error = {:?}", e);
+                                        tracing::debug!(
+                                            "client_side_sse: fallback data = {}",
+                                            data
+                                        );
+                                        serde_json::from_str::<ServerJsonRpcMessage>(&data)
+                                    }
+                                }
+                            } else if let Ok(json) =
+                                serde_json::from_str::<serde_json::Value>(&data)
+                            {
+                                if json.get("event")
+                                    == Some(&serde_json::Value::String("message".to_string()))
+                                {
+                                    if let Some(inner) = json.get("data").and_then(|v| v.as_str()) {
+                                        serde_json::from_str::<ServerJsonRpcMessage>(inner)
+                                    } else {
+                                        Err(serde_json::from_str::<ServerJsonRpcMessage>("null")
+                                            .unwrap_err())
+                                    }
+                                } else {
+                                    serde_json::from_value::<ServerJsonRpcMessage>(json)
+                                }
+                            } else {
+                                serde_json::from_str::<ServerJsonRpcMessage>(&data)
+                            };
+                            match try_message {
                                 Err(e) => {
                                     // not sure should this be a hard error
-                                    tracing::warn!("failed to deserialize server message: {e}");
+                                    tracing::warn!(
+                                        "failed to deserialize server message: {e}, raw data: {}",
+                                        data
+                                    );
                                     return self.poll_next(cx);
                                 }
                                 Ok(message) => {
                                     return Poll::Ready(Some(Ok(message)));
                                 }
-                            };
+                            }
                         } else {
                             return self.poll_next(cx);
                         }

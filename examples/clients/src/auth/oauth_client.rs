@@ -143,7 +143,11 @@ async fn main() -> Result<()> {
     let am = oauth_state
         .into_authorization_manager()
         .ok_or_else(|| anyhow::anyhow!("Failed to get authorization manager"))?;
-    let client = AuthClient::new(reqwest::Client::default(), am);
+    let extend_client = rmcp::transport::common::reqwest::sse_client::ExtendSseClient {
+        client: reqwest::Client::default(),
+        tmcp_connection: None,
+    };
+    let client = AuthClient::new(extend_client, am);
     let transport = SseClientTransport::start_with_client(
         client,
         SseClientConfig {

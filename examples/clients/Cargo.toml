@@ -56,3 +56,11 @@ path = "src/auth/oauth_client.rs"
 [[example]]
 name = "clients_sampling_stdio"
 path = "src/sampling_stdio.rs"
+
+[[example]]
+name = "clients_sse_tmcp"
+path = "src/sse_tmcp.rs"
+
+[[example]]
+name = "clients_streamable_http_tmcp"
+path = "src/streamable_http_tmcp.rs"

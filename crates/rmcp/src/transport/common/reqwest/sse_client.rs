@@ -5,22 +5,38 @@ use http::Uri;
 use reqwest::header::ACCEPT;
 use sse_stream::SseStream;
 
-use crate::transport::{
-    SseClientTransport,
-    common::http_header::{EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID},
-    sse_client::{SseClient, SseClientConfig, SseTransportError},
+pub use crate::transport::common::reqwest::tmcp_client::TmcpReqwestClient;
+use crate::{
+    model::ClientJsonRpcMessage,
+    transport::{
+        SseClientTransport,
+        common::http_header::{EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID},
+        sse_client::{SseClient, SseClientConfig, SseTransportError},
+    },
 };
+pub type TmcpSseReqwestClient = TmcpReqwestClient;
+use crate::transport::common::TmcpMessageCodec;
 
-impl SseClient for reqwest::Client {
+impl SseClient for TmcpSseReqwestClient {
     type Error = reqwest::Error;
 
     async fn post_message(
         &self,
         uri: Uri,
-        message: crate::model::ClientJsonRpcMessage,
+        message: ClientJsonRpcMessage,
         auth_token: Option<String>,
     ) -> Result<(), SseTransportError<Self::Error>> {
-        let mut request_builder = self.post(uri.to_string()).json(&message);
+        let mut request_builder = self.client.post(uri.to_string());
+        if self.tmcp_connection.is_some() {
+            let sealed = self
+                .seal_message(&serde_json::to_string(&message).unwrap())
+                .unwrap_or_else(|_| serde_json::to_string(&message).unwrap());
+            request_builder = request_builder
+                .body(sealed)
+                .header("content-type", "application/tsp");
+        } else {
+            request_builder = request_builder.json(&message);
+        }
         if let Some(auth_header) = auth_token {
             request_builder = request_builder.bearer_auth(auth_header);
         }
@@ -42,6 +58,7 @@ impl SseClient for reqwest::Client {
         SseTransportError<Self::Error>,
     > {
         let mut request_builder = self
+            .client
             .get(uri.to_string())
             .header(ACCEPT, EVENT_STREAM_MIME_TYPE);
         if let Some(auth_header) = auth_token {
@@ -62,17 +79,52 @@ impl SseClient for reqwest::Client {
                 return Err(SseTransportError::UnexpectedContentType(None));
             }
         }
-        let event_stream = SseStream::from_byte_stream(response.bytes_stream()).boxed();
+        let tmcp_connection = self.tmcp_connection.clone();
+        let event_stream = SseStream::from_byte_stream(response.bytes_stream())
+            .filter_map(move |evt| {
+                let tmcp_connection = tmcp_connection.clone();
+                async move {
+                    match evt {
+                        Ok(mut sse) => {
+                            if let Some(ref tmcp_conn) = tmcp_connection {
+                                if let Some(data) = &sse.data {
+                                    let client = TmcpSseReqwestClient {
+                                        client: reqwest::Client::default(),
+                                        tmcp_connection: Some(tmcp_conn.clone()),
+                                    };
+                                    match client.open_message(data) {
+                                        Ok(opened) => {
+                                            sse.data = Some(opened);
+                                            Some(Ok(sse))
+                                        }
+                                        Err(_) => Some(Ok(sse)),
+                                    }
+                                } else {
+                                    Some(Ok(sse))
+                                }
+                            } else {
+                                Some(Ok(sse))
+                            }
+                        }
+                        Err(e) => Some(Err(sse_stream::Error::from(e))),
+                    }
+                }
+            })
+            .boxed();
         Ok(event_stream)
     }
 }
 
-impl SseClientTransport<reqwest::Client> {
-    pub async fn start(
+impl SseClientTransport<TmcpSseReqwestClient> {
+    pub async fn start_with_tmcp(
         uri: impl Into<Arc<str>>,
+        tmcp_connection: Option<crate::transport::common::tmcp::TmcpConnection>,
     ) -> Result<Self, SseTransportError<reqwest::Error>> {
         SseClientTransport::start_with_client(
-            reqwest::Client::default(),
+            TmcpSseReqwestClient {
+                client: reqwest::Client::default(),
+                tmcp_connection,
+            },
             SseClientConfig {
                 sse_endpoint: uri.into(),
                 ..Default::default()

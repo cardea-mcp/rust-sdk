@@ -9,7 +9,10 @@ use thiserror::Error;
 
 use super::{
     Transport,
-    common::client_side_sse::{BoxedSseResponse, SseRetryPolicy, SseStreamReconnect},
+    common::{
+        client_side_sse::{BoxedSseResponse, SseRetryPolicy, SseStreamReconnect},
+        tmcp::{TmcpConnection, TmcpIdentityManager, TmcpSettings, resolve_server},
+    },
 };
 use crate::{
     RoleClient,
@@ -37,6 +40,82 @@ pub enum SseTransportError<E: std::error::Error + Send + Sync + 'static> {
     InvalidUri(#[from] http::uri::InvalidUri),
     #[error("Invalid uri parts: {0}")]
     InvalidUriParts(#[from] http::uri::InvalidUriParts),
+}
+
+pub struct SseClientAuto {
+    pub identity: Option<TmcpIdentityManager>,
+    pub tmcp_connection: Option<TmcpConnection>,
+    pub sse_endpoint: String,
+    pub transport:
+        SseClientTransport<crate::transport::common::reqwest::sse_client::TmcpSseReqwestClient>,
+}
+
+impl SseClientAuto {
+    pub async fn new(
+        alias: &str,
+        server_did: &str,
+        tmcp_settings: Option<TmcpSettings>,
+    ) -> anyhow::Result<Self> {
+        let (identity, tmcp_connection, sse_endpoint, transport);
+
+        if let Some(settings) = tmcp_settings {
+            let id = TmcpIdentityManager::new(alias, settings).await?;
+            let conn = id.get_connection(server_did).await?;
+            let endpoint = resolve_server(server_did, Some(id.did.as_str())).await?;
+            if !endpoint.starts_with("sse://")
+                && !endpoint.starts_with("sses://")
+                && !endpoint.starts_with("http://")
+                && !endpoint.starts_with("https://")
+            {
+                anyhow::bail!("Server does not use SSE for transport: {}", endpoint);
+            }
+            let endpoint = endpoint
+                .replace("sse://", "http://")
+                .replace("sses://", "https://");
+            let config = SseClientConfig {
+                sse_endpoint: endpoint.clone().into(),
+                ..Default::default()
+            };
+            transport = SseClientTransport::<
+                crate::transport::common::reqwest::sse_client::TmcpSseReqwestClient,
+            >::start_with_client(
+                crate::transport::common::reqwest::sse_client::TmcpSseReqwestClient {
+                    client: reqwest::Client::new(),
+                    tmcp_connection: Some(conn.clone()),
+                },
+                config,
+            )
+            .await?;
+            identity = Some(id);
+            tmcp_connection = Some(conn);
+            sse_endpoint = endpoint;
+        } else {
+            let endpoint = server_did.to_string();
+            let config = SseClientConfig {
+                sse_endpoint: endpoint.clone().into(),
+                ..Default::default()
+            };
+            transport = SseClientTransport::<
+                crate::transport::common::reqwest::sse_client::TmcpSseReqwestClient,
+            >::start_with_client(
+                crate::transport::common::reqwest::sse_client::TmcpSseReqwestClient {
+                    client: reqwest::Client::new(),
+                    tmcp_connection: None,
+                },
+                config,
+            )
+            .await?;
+            identity = None;
+            tmcp_connection = None;
+            sse_endpoint = endpoint;
+        }
+        Ok(Self {
+            identity,
+            tmcp_connection,
+            sse_endpoint,
+            transport,
+        })
+    }
 }
 
 impl From<reqwest::Error> for SseTransportError<reqwest::Error> {
@@ -112,6 +191,25 @@ impl<C: SseClient + std::fmt::Debug> std::fmt::Debug for SseClientTransport<C> {
     }
 }
 
+impl SseClientTransport<crate::transport::common::reqwest::sse_client::TmcpSseReqwestClient> {
+    pub async fn start<S: AsRef<str>>(
+        sse_endpoint: S,
+    ) -> Result<Self, SseTransportError<reqwest::Error>> {
+        let config = SseClientConfig {
+            sse_endpoint: sse_endpoint.as_ref().into(),
+            ..Default::default()
+        };
+        Self::start_with_client(
+            crate::transport::common::reqwest::sse_client::TmcpSseReqwestClient {
+                client: reqwest::Client::new(),
+                tmcp_connection: None,
+            },
+            config,
+        )
+        .await
+    }
+}
+
 impl<C: SseClient> SseClientTransport<C> {
     pub async fn start_with_client(
         client: C,
@@ -132,12 +230,24 @@ impl<C: SseClient> SseClientTransport<C> {
                     .next()
                     .await
                     .ok_or(SseTransportError::UnexpectedEndOfStream)??;
-                let Some("endpoint") = sse.event.as_deref() else {
-                    continue;
-                };
-                let ep = sse.data.unwrap_or_default();
-
-                break message_endpoint(sse_endpoint.clone(), ep)?;
+                if let Some("endpoint") = sse.event.as_deref() {
+                    let ep = sse.data.unwrap_or_default();
+                    break message_endpoint(sse_endpoint.clone(), ep)?;
+                }
+                if let (Some("message"), Some(data_str)) = (sse.event.as_deref(), &sse.data) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                        if json.get("event")
+                            == Some(&serde_json::Value::String("endpoint".to_string()))
+                        {
+                            let ep = json
+                                .get("data")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            break message_endpoint(sse_endpoint.clone(), ep.to_string())?;
+                        }
+                    }
+                }
+                continue;
             }
         };
 
@@ -148,6 +258,7 @@ impl<C: SseClient> SseClientTransport<C> {
                 uri: sse_endpoint.clone(),
             },
             config.retry_policy.clone(),
+            None,
         ));
         Ok(Self {
             client,

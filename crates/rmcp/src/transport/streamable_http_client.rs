@@ -6,7 +6,10 @@ use sse_stream::Sse;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::common::client_side_sse::{ExponentialBackoff, SseRetryPolicy, SseStreamReconnect};
+use super::common::{
+    client_side_sse::{ExponentialBackoff, SseRetryPolicy, SseStreamReconnect},
+    tmcp::{TmcpConnection, TmcpIdentityManager, TmcpSettings, resolve_server},
+};
 use crate::{
     RoleClient,
     model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
@@ -15,6 +18,44 @@ use crate::{
         worker::{Worker, WorkerQuitReason, WorkerSendRequest, WorkerTransport},
     },
 };
+
+pub struct StreamableHttpClientAuto {
+    pub identity: TmcpIdentityManager,
+    pub tmcp_connection: TmcpConnection,
+    pub url: String,
+    pub transport: StreamableHttpClientTransport<
+        crate::transport::common::reqwest::streamable_http_client::TmcpReqwestClient,
+    >,
+}
+
+impl StreamableHttpClientAuto {
+    pub async fn new(
+        alias: &str,
+        server_did: &str,
+        tmcp_settings: Option<TmcpSettings>,
+    ) -> anyhow::Result<Self> {
+        let settings = tmcp_settings.unwrap_or_default();
+        let identity = TmcpIdentityManager::new(alias, settings).await?;
+        let tmcp_connection = identity.get_connection(server_did).await?;
+        let url = resolve_server(server_did, Some(identity.did.as_str())).await?;
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            anyhow::bail!("Server does not use HTTP for transport: {}", url);
+        }
+        let transport = StreamableHttpClientTransport::with_client(
+            crate::transport::common::reqwest::streamable_http_client::TmcpReqwestClient {
+                client: reqwest::Client::new(),
+                tmcp_connection: Some(tmcp_connection.clone()),
+            },
+            StreamableHttpClientTransportConfig::with_uri(url.clone()),
+        );
+        Ok(Self {
+            identity,
+            tmcp_connection,
+            url,
+            transport,
+        })
+    }
+}
 
 type BoxedSseStream = BoxStream<'static, Result<Sse, SseError>>;
 
@@ -80,6 +121,7 @@ impl std::fmt::Debug for StreamableHttpPostResponse {
 impl StreamableHttpPostResponse {
     pub async fn expect_initialized<E>(
         self,
+        tmcp_connection: Option<&TmcpConnection>,
     ) -> Result<(ServerJsonRpcMessage, Option<String>), StreamableHttpError<E>>
     where
         E: std::error::Error + Send + Sync + 'static,
@@ -94,8 +136,40 @@ impl StreamableHttpPostResponse {
                         .ok_or(StreamableHttpError::UnexpectedServerResponse(
                             "empty sse stream".into(),
                         ))??;
-                let message: ServerJsonRpcMessage =
-                    serde_json::from_str(&event.data.unwrap_or_default())?;
+                let data = event.data.unwrap_or_default();
+                tracing::debug!(
+                    "expect_initialized: tmcp_connection is_some = {}",
+                    tmcp_connection.is_some()
+                );
+                tracing::debug!("expect_initialized: sse data = {}", data);
+
+                let message = if let Some(conn) = tmcp_connection {
+                    tracing::debug!("expect_initialized: entering decode branch");
+                    match conn.open_message(&data) {
+                        Ok(decoded) => {
+                            tracing::debug!("expect_initialized: decoded = {}", decoded);
+                            serde_json::from_str::<ServerJsonRpcMessage>(&decoded)?
+                        }
+                        Err(e) => {
+                            tracing::error!("expect_initialized: decode error = {:?}", e);
+                            tracing::debug!("expect_initialized: fallback data = {}", data);
+                            serde_json::from_str::<ServerJsonRpcMessage>(&data)?
+                        }
+                    }
+                } else if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if json.get("event") == Some(&serde_json::Value::String("message".to_string()))
+                    {
+                        if let Some(inner) = json.get("data").and_then(|v| v.as_str()) {
+                            serde_json::from_str::<ServerJsonRpcMessage>(inner)?
+                        } else {
+                            serde_json::from_str::<ServerJsonRpcMessage>("null")?
+                        }
+                    } else {
+                        serde_json::from_value::<ServerJsonRpcMessage>(json)?
+                    }
+                } else {
+                    serde_json::from_str::<ServerJsonRpcMessage>(&data)?
+                };
                 Ok((message, session_id))
             }
             _ => Err(StreamableHttpError::UnexpectedServerResponse(
@@ -137,6 +211,7 @@ pub trait StreamableHttpClient: Clone + Send + 'static {
         message: ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
         auth_header: Option<String>,
+        content: Option<String>,
     ) -> impl Future<Output = Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>>>
     + Send
     + '_;
@@ -188,10 +263,11 @@ impl<C: StreamableHttpClient> SseStreamReconnect for StreamableHttpClientReconne
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct StreamableHttpClientWorker<C: StreamableHttpClient> {
     pub client: C,
     pub config: StreamableHttpClientTransportConfig,
+    pub tmcp_connection: Option<TmcpConnection>,
 }
 
 impl<C: StreamableHttpClient + Default> StreamableHttpClientWorker<C> {
@@ -202,13 +278,18 @@ impl<C: StreamableHttpClient + Default> StreamableHttpClientWorker<C> {
                 uri: url.into(),
                 ..Default::default()
             },
+            tmcp_connection: None,
         }
     }
 }
 
 impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
     pub fn new(client: C, config: StreamableHttpClientTransportConfig) -> Self {
-        Self { client, config }
+        Self {
+            client,
+            config,
+            tmcp_connection: None,
+        }
     }
 }
 
@@ -250,7 +331,10 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
     }
 }
 
-impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
+impl<C> Worker for StreamableHttpClientWorker<C>
+where
+    C: StreamableHttpClient,
+{
     type Role = RoleClient;
     type Error = StreamableHttpError<C::Error>;
     fn err_closed() -> Self::Error {
@@ -280,24 +364,32 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
             message: initialize_request,
         } = context.recv_from_handler().await?;
         let _ = responder.send(Ok(()));
-        let (message, session_id) = self
-            .client
-            .post_message(config.uri.clone(), initialize_request, None, None)
-            .await
-            .map_err(WorkerQuitReason::fatal_context("send initialize request"))?
-            .expect_initialized::<C::Error>()
-            .await
-            .map_err(WorkerQuitReason::fatal_context(
-                "process initialize response",
-            ))?;
+        let (message, session_id) = {
+            let resp_result = self
+                .client
+                .post_message(config.uri.clone(), initialize_request, None, None, None)
+                .await;
+            let resp = match resp_result {
+                Err(e) => {
+                    return Err(WorkerQuitReason::fatal(e, "send initialize request"));
+                }
+                Ok(r) => r,
+            };
+            let expect_result = resp
+                .expect_initialized::<C::Error>(self.tmcp_connection.as_ref())
+                .await;
+            match expect_result {
+                Ok((msg, sid)) => (msg, sid),
+                Err(e) => {
+                    return Err(WorkerQuitReason::fatal(e, "process initialize response"));
+                }
+            }
+        };
         let session_id: Option<Arc<str>> = if let Some(session_id) = session_id {
             Some(session_id.into())
         } else {
             if !self.config.allow_stateless {
-                return Err(WorkerQuitReason::fatal(
-                    StreamableHttpError::<C::Error>::MissingSessionIdInResponse,
-                    "process initialize response",
-                ));
+                return Err(WorkerQuitReason::HandlerTerminated);
             }
             None
         };
@@ -334,21 +426,33 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
         context.send_to_handler(message).await?;
         let initialized_notification = context.recv_from_handler().await?;
         // expect a initialized response
-        self.client
-            .post_message(
-                config.uri.clone(),
-                initialized_notification.message,
-                session_id.clone(),
-                None,
-            )
-            .await
-            .map_err(WorkerQuitReason::fatal_context(
-                "send initialized notification",
-            ))?
-            .expect_accepted::<C::Error>()
-            .map_err(WorkerQuitReason::fatal_context(
-                "process initialized notification response",
-            ))?;
+        {
+            let resp_result = self
+                .client
+                .post_message(
+                    config.uri.clone(),
+                    initialized_notification.message,
+                    session_id.clone(),
+                    None,
+                    None,
+                )
+                .await;
+            let resp = match resp_result {
+                Err(e) => {
+                    return Err(WorkerQuitReason::fatal(e, "send initialized notification"));
+                }
+                Ok(r) => r,
+            };
+            match resp.expect_accepted::<C::Error>() {
+                Ok(_) => (),
+                Err(e) => {
+                    return Err(WorkerQuitReason::fatal(
+                        e,
+                        "process initialized notification response",
+                    ));
+                }
+            }
+        }
         let _ = initialized_notification.responder.send(Ok(()));
         enum Event<W: Worker, E: std::error::Error + Send + Sync + 'static> {
             ClientMessage(WorkerSendRequest<W>),
@@ -371,6 +475,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                             uri: config.uri.clone(),
                         },
                         self.config.retry_config.clone(),
+                        self.tmcp_connection.clone(),
                     );
                     streams.spawn(Self::execute_sse_stream(
                         sse_stream,
@@ -426,7 +531,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                     let WorkerSendRequest { message, responder } = send_request;
                     let response = self
                         .client
-                        .post_message(config.uri.clone(), message, session_id.clone(), None)
+                        .post_message(config.uri.clone(), message, session_id.clone(), None, None)
                         .await;
                     let send_result = match response {
                         Err(e) => Err(e),
@@ -448,6 +553,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                                         uri: config.uri.clone(),
                                     },
                                     self.config.retry_config.clone(),
+                                    self.tmcp_connection.clone(),
                                 );
                                 streams.spawn(Self::execute_sse_stream(
                                     sse_stream,
@@ -494,7 +600,16 @@ pub type StreamableHttpClientTransport<C> = WorkerTransport<StreamableHttpClient
 
 impl<C: StreamableHttpClient> StreamableHttpClientTransport<C> {
     pub fn with_client(client: C, config: StreamableHttpClientTransportConfig) -> Self {
-        let worker = StreamableHttpClientWorker::new(client, config);
+        let tmcp_connection = {
+            let any_client = &client as &dyn std::any::Any;
+            if let Some(tmcp_client) = any_client.downcast_ref::<crate::transport::common::reqwest::streamable_http_client::TmcpReqwestClient>() {
+                tmcp_client.tmcp_connection.clone()
+            } else {
+                None
+            }
+        };
+        let mut worker = StreamableHttpClientWorker::new(client, config);
+        worker.tmcp_connection = tmcp_connection;
         WorkerTransport::spawn(worker)
     }
 }
@@ -524,5 +639,20 @@ impl Default for StreamableHttpClientTransportConfig {
             channel_buffer_capacity: 16,
             allow_stateless: true,
         }
+    }
+}
+
+pub fn convert_quit_reason<C: StreamableHttpClient>(
+    reason: WorkerQuitReason<StreamableHttpError<C::Error>>,
+) -> WorkerQuitReason<C::Error> {
+    match reason {
+        WorkerQuitReason::Cancelled => WorkerQuitReason::Cancelled,
+        WorkerQuitReason::HandlerTerminated => WorkerQuitReason::HandlerTerminated,
+        WorkerQuitReason::Join(e) => WorkerQuitReason::Join(e),
+        WorkerQuitReason::TransportClosed => WorkerQuitReason::TransportClosed,
+        WorkerQuitReason::Fatal { error, context } => match error {
+            StreamableHttpError::Client(e) => WorkerQuitReason::Fatal { error: e, context },
+            _ => WorkerQuitReason::HandlerTerminated,
+        },
     }
 }
