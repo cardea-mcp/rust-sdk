@@ -8,7 +8,7 @@ use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use sse_stream::{KeepAlive, Sse, SseBody};
 
 use super::http_header::EVENT_STREAM_MIME_TYPE;
-use crate::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
+use crate::model::ClientJsonRpcMessage;
 
 pub type SessionId = Arc<str>;
 
@@ -59,7 +59,7 @@ impl sse_stream::Timer for TokioTimer {
 #[derive(Debug, Clone)]
 pub struct ServerSseMessage {
     pub event_id: Option<String>,
-    pub message: Arc<ServerJsonRpcMessage>,
+    pub message: Arc<String>,
 }
 
 pub(crate) fn sse_stream_response(
@@ -68,8 +68,7 @@ pub(crate) fn sse_stream_response(
 ) -> Response<BoxBody<Bytes, Infallible>> {
     use futures::StreamExt;
     let stream = SseBody::new(stream.map(|message| {
-        let data = serde_json::to_string(&message.message).expect("valid message");
-        let mut sse = Sse::default().data(data);
+        let mut sse = Sse::default().data((*message.message).clone());
         sse.id = message.event_id;
         Result::<Sse, Infallible>::Ok(sse)
     }));

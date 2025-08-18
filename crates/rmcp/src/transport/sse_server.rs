@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
-    Extension, Json, Router,
+    Extension, Router,
     extract::{NestedPath, Query, State},
     http::{StatusCode, request::Parts},
     response::{
@@ -10,6 +10,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::{CancellationToken, PollSender};
@@ -19,25 +20,27 @@ use crate::{
     RoleServer, Service,
     model::ClientJsonRpcMessage,
     service::{RxJsonRpcMessage, TxJsonRpcMessage, serve_directly_with_ct},
-    transport::common::server_side_http::{DEFAULT_AUTO_PING_INTERVAL, SessionId, session_id},
+    transport::{
+        common::server_side_http::{DEFAULT_AUTO_PING_INTERVAL, SessionId, session_id},
+        tsp_utils::get_client_did,
+    },
 };
-
 type TxStore =
     Arc<tokio::sync::RwLock<HashMap<SessionId, tokio::sync::mpsc::Sender<ClientJsonRpcMessage>>>>;
 pub type TransportReceiver = ReceiverStream<RxJsonRpcMessage<RoleServer>>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct App {
     txs: TxStore,
     transport_tx: tokio::sync::mpsc::UnboundedSender<SseServerTransport>,
-    post_path: Arc<str>,
     sse_ping_interval: Duration,
+    manager: Option<std::sync::Arc<crate::transport::common::tmcp::TmcpIdentityManager>>,
 }
 
 impl App {
     pub fn new(
-        post_path: String,
         sse_ping_interval: Duration,
+        manager: Option<std::sync::Arc<crate::transport::common::tmcp::TmcpIdentityManager>>,
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<SseServerTransport>,
@@ -47,8 +50,8 @@ impl App {
             Self {
                 txs: Default::default(),
                 transport_tx,
-                post_path: post_path.into(),
                 sse_ping_interval,
+                manager,
             },
             transport_rx,
         )
@@ -61,22 +64,66 @@ pub struct PostEventQuery {
     pub session_id: String,
 }
 
+use axum::http::HeaderMap;
+
 async fn post_event_handler(
     State(app): State<App>,
-    Query(PostEventQuery { session_id }): Query<PostEventQuery>,
+    Query(query): Query<HashMap<String, String>>,
     parts: Parts,
-    Json(mut message): Json<ClientJsonRpcMessage>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    tracing::debug!(session_id, ?parts, ?message, "new client message");
-    let tx = {
-        let rg = app.txs.read().await;
-        rg.get(session_id.as_str())
-            .ok_or(StatusCode::NOT_FOUND)?
-            .clone()
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let session_id_from_query = parts.uri.query().and_then(|q| {
+        url::form_urlencoded::parse(q.as_bytes())
+            .find(|(k, _)| k == "sessionId")
+            .map(|(_, v)| v.into_owned())
+    });
+    let client_key = if let Some(session_id) = session_id_from_query {
+        Arc::from(session_id)
+    } else if let Some(did) = query.get("did") {
+        let did_decoded = percent_encoding::percent_decode_str(did)
+            .decode_utf8_lossy()
+            .to_string();
+        Arc::from(did_decoded)
+    } else if let Some(session_id) = query.get("session_id") {
+        Arc::from(session_id.clone())
+    } else {
+        Arc::from("")
     };
+
+    let parse_result = crate::transport::tsp_utils::parse_message_by_content_type(
+        content_type,
+        http_body_util::Full::new(body.clone()),
+        app.manager.clone(),
+        &parts,
+    )
+    .await;
+    let mut message: ClientJsonRpcMessage = parse_result.unwrap();
+
+    let tx = {
+        let rg = app.txs.write().await;
+        if !rg.contains_key(&client_key) {
+            if rg.contains_key(&Arc::from("")) {
+                rg.get(&Arc::from("")).unwrap().clone()
+            } else {
+                return Err(StatusCode::NOT_FOUND);
+            }
+        } else {
+            rg.get(&client_key).unwrap().clone()
+        }
+    };
+    tracing::debug!(
+        session_id=?client_key,
+        ?parts,
+        ?message,
+        "new client message"
+    );
     message.insert_extension(parts);
     if tx.send(message).await.is_err() {
-        tracing::error!("send message error");
         return Err(StatusCode::GONE);
     }
     Ok(StatusCode::ACCEPTED)
@@ -93,14 +140,22 @@ async fn sse_handler(
     use tokio_util::sync::PollSender;
     let (from_client_tx, from_client_rx) = tokio::sync::mpsc::channel(64);
     let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel(64);
-    let to_client_tx_clone = to_client_tx.clone();
 
-    app.txs
-        .write()
-        .await
-        .insert(session.clone(), from_client_tx);
-    let session = session.clone();
+    let client_did = get_client_did(&parts);
+
+    let did_decoded = percent_encoding::percent_decode_str(&client_did)
+        .decode_utf8_lossy()
+        .to_string();
+    if !client_did.is_empty() {
+        app.txs
+            .write()
+            .await
+            .insert(Arc::from(did_decoded), from_client_tx);
+    } else {
+        app.txs.write().await.insert(Arc::from(""), from_client_tx);
+    }
     let stream = ReceiverStream::new(from_client_rx);
+    let to_client_tx_clone = to_client_tx.clone();
     let sink = PollSender::new(to_client_tx);
     let transport = SseServerTransport {
         stream,
@@ -116,32 +171,104 @@ async fn sse_handler(
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
         return Err(response);
     }
-    let nested_path = nested_path.as_deref().map(NestedPath::as_str).unwrap_or("");
-    let post_path = app.post_path.as_ref();
-    let ping_interval = app.sse_ping_interval;
-    let stream = futures::stream::once(futures::future::ok(
-        Event::default()
-            .event("endpoint")
-            .data(format!("{nested_path}{post_path}?sessionId={session}")),
-    ))
-    .chain(ReceiverStream::new(to_client_rx).map(|message| {
-        match serde_json::to_string(&message) {
-            Ok(bytes) => Ok(Event::default().event("message").data(&bytes)),
-            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-        }
-    }));
-
+    let session_id = session.clone();
+    let tx_store = app.txs.clone();
     tokio::spawn(async move {
-        // Wait for connection closure
         to_client_tx_clone.closed().await;
-
-        // Clean up session
-        let session_id = session.clone();
-        let tx_store = app.txs.clone();
         let mut txs = tx_store.write().await;
         txs.remove(&session_id);
         tracing::debug!(%session_id, "Closed session and cleaned up resources");
     });
+    let ping_interval = app.sse_ping_interval;
+
+    use std::pin::Pin;
+
+    use futures::Stream as FuturesStream;
+
+    let stream: Pin<Box<dyn FuturesStream<Item = Result<Event, io::Error>> + Send>> =
+        if let Some(manager) = app.manager.clone() {
+            if !client_did.is_empty() {
+                let did_decoded = percent_encoding::percent_decode_str(&client_did)
+                    .decode_utf8_lossy()
+                    .to_string();
+                match manager.get_connection(&did_decoded).await {
+                    Ok(tmcp_conn) => {
+                        let tmcp: std::sync::Arc<_> = std::sync::Arc::new(tmcp_conn);
+                        let nested_path_str =
+                            nested_path.as_deref().map(NestedPath::as_str).unwrap_or("");
+                        let endpoint_path =
+                            format!("{}{}?did={}", nested_path_str, "/message", client_did);
+                        let sealed = tmcp
+                            .seal_message(&endpoint_path)
+                            .unwrap_or_else(|_| "seal_message error".to_string());
+                        Box::pin(
+                            futures::stream::once(futures::future::ok(
+                                Event::default().event("endpoint").data(sealed),
+                            ))
+                            .chain(
+                                ReceiverStream::new(to_client_rx).map({
+                                    let tmcp = tmcp.clone();
+                                    move |message| {
+                                        let json =
+                                            serde_json::to_string(&message).map_err(|e| {
+                                                io::Error::new(io::ErrorKind::InvalidData, e)
+                                            })?;
+                                        let sealed = tmcp.seal_message(&json).map_err(|e| {
+                                            io::Error::new(io::ErrorKind::InvalidData, e)
+                                        })?;
+                                        Ok(Event::default().event("message").data(&sealed))
+                                    }
+                                }),
+                            ),
+                        )
+                    }
+                    Err(_) => Box::pin(
+                        futures::stream::once(futures::future::ok::<Event, io::Error>(
+                            Event::default().event("endpoint").data(""),
+                        ))
+                        .chain(ReceiverStream::new(to_client_rx).map(
+                            move |message| {
+                                let json = serde_json::to_string(&message)
+                                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                                Ok(Event::default().event("message").data(json))
+                            },
+                        )),
+                    ),
+                }
+            } else {
+                Box::pin(
+                    futures::stream::once(futures::future::ok::<Event, io::Error>({
+                        let nested_path_str =
+                            nested_path.as_deref().map(NestedPath::as_str).unwrap_or("");
+                        Event::default()
+                            .event("endpoint")
+                            .data(format!("{}{}", nested_path_str, "/message"))
+                    }))
+                    .chain(ReceiverStream::new(to_client_rx).map(
+                        move |message| {
+                            let json = serde_json::to_string(&message)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                            Ok(Event::default().event("message").data(json))
+                        },
+                    )),
+                )
+            }
+        } else {
+            Box::pin(
+                futures::stream::once(futures::future::ok::<Event, io::Error>({
+                    let nested_path_str =
+                        nested_path.as_deref().map(NestedPath::as_str).unwrap_or("");
+                    Event::default()
+                        .event("endpoint")
+                        .data(format!("{}{}", nested_path_str, "/message"))
+                }))
+                .chain(ReceiverStream::new(to_client_rx).map(move |message| {
+                    let json = serde_json::to_string(&message)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    Ok(Event::default().event("message").data(json))
+                })),
+            )
+        };
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(ping_interval)))
 }
@@ -221,6 +348,7 @@ pub struct SseServerConfig {
     pub post_path: String,
     pub ct: CancellationToken,
     pub sse_keep_alive: Option<Duration>,
+    pub manager: Option<std::sync::Arc<crate::transport::common::tmcp::TmcpIdentityManager>>,
 }
 
 #[derive(Debug)]
@@ -237,6 +365,7 @@ impl SseServer {
             post_path: "/message".to_string(),
             ct: CancellationToken::new(),
             sse_keep_alive: None,
+            manager: None,
         })
         .await
     }
@@ -261,12 +390,16 @@ impl SseServer {
 
     pub fn new(config: SseServerConfig) -> (SseServer, Router) {
         let (app, transport_rx) = App::new(
-            config.post_path.clone(),
             config.sse_keep_alive.unwrap_or(DEFAULT_AUTO_PING_INTERVAL),
+            config.manager.clone(),
         );
         let router = Router::new()
             .route(&config.sse_path, get(sse_handler))
             .route(&config.post_path, post(post_event_handler))
+            .route(
+                &format!("{}/", config.post_path.trim_end_matches('/')),
+                post(post_event_handler),
+            )
             .with_state(app);
 
         let server = SseServer {

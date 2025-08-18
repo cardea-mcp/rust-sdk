@@ -1,5 +1,3 @@
-
-
 [package]
 name = "mcp-server-examples"
 version = "0.1.5"
@@ -7,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+tsp_sdk = { workspace = true }
 rmcp = { workspace = true, features = [
     "server",
     "macros",
@@ -93,3 +92,15 @@ path = "src/structured_output.rs"
 [[example]]
 name = "servers_elicitation_stdio"
 path = "src/elicitation_stdio.rs"
+
+[[example]]
+name = "servers_counter_sse_tmcp"
+path = "src/counter_sse_tmcp.rs"
+
+[[example]]
+name = "servers_counter_streamhttp_tmcp"
+path = "src/counter_streamhttp_tmcp.rs"
+
+[[example]]
+name = "counter_hyper_streamable_http_tmcp"
+path = "src/counter_hyper_streamable_http_tmcp.rs"

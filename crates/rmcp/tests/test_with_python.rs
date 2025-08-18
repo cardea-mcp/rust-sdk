@@ -65,6 +65,7 @@ async fn test_nested_with_python_client() -> anyhow::Result<()> {
         post_path: "/message".to_string(),
         ct: CancellationToken::new(),
         sse_keep_alive: None,
+        manager: None,
     };
 
     let listener = tokio::net::TcpListener::bind(&sse_config.bind).await?;

@@ -655,6 +655,7 @@ async fn main() -> Result<()> {
         post_path: "/mcp/message".to_string(),
         ct: CancellationToken::new(),
         sse_keep_alive: Some(Duration::from_secs(15)),
+        manager: None,
     };
 
     // Create SSE server

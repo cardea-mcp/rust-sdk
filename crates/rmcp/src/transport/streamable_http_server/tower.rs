@@ -20,10 +20,11 @@ use crate::{
                 EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
             },
             server_side_http::{
-                BoxResponse, ServerSseMessage, accepted_response, expect_json,
-                internal_error_response, sse_stream_response, unexpected_message_response,
+                BoxResponse, ServerSseMessage, accepted_response, internal_error_response,
+                sse_stream_response, unexpected_message_response,
             },
         },
+        tsp_utils::get_client_did,
     },
 };
 
@@ -33,6 +34,8 @@ pub struct StreamableHttpServerConfig {
     pub sse_keep_alive: Option<Duration>,
     /// If true, the server will create a session for each request and keep it alive.
     pub stateful_mode: bool,
+    /// Optional TMCP identity manager for DID trust.
+    pub manager: Option<Arc<crate::transport::common::tmcp::TmcpIdentityManager>>,
 }
 
 impl Default for StreamableHttpServerConfig {
@@ -40,6 +43,7 @@ impl Default for StreamableHttpServerConfig {
         Self {
             sse_keep_alive: Some(Duration::from_secs(15)),
             stateful_mode: true,
+            manager: None,
         }
     }
 }
@@ -153,7 +157,6 @@ where
         B: Body + Send + 'static,
         B::Error: Display,
     {
-        // check accept header
         if !request
             .headers()
             .get(http::header::ACCEPT)
@@ -170,14 +173,12 @@ where
                 )
                 .expect("valid response"));
         }
-        // check session id
         let session_id = request
             .headers()
             .get(HEADER_SESSION_ID)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned().into());
         let Some(session_id) = session_id else {
-            // unauthorized
             return Ok(Response::builder()
                 .status(http::StatusCode::UNAUTHORIZED)
                 .body(Full::new(Bytes::from("Unauthorized: Session ID is required")).boxed())
@@ -241,29 +242,39 @@ where
                 .expect("valid response"));
         }
 
-        // check content type
-        if !request
-            .headers()
+        // json deserialize request body
+        let (part, body) = request.into_parts();
+        let content_type = part
+            .headers
             .get(http::header::CONTENT_TYPE)
             .and_then(|header| header.to_str().ok())
-            .is_some_and(|header| header.starts_with(JSON_MIME_TYPE))
+            .unwrap_or("<none>");
+        if !["application/json", "text/plain", "application/octet-stream"]
+            .iter()
+            .any(|ct| content_type.starts_with(ct))
         {
             return Ok(Response::builder()
                 .status(http::StatusCode::UNSUPPORTED_MEDIA_TYPE)
                 .body(
                     Full::new(Bytes::from(
-                        "Unsupported Media Type: Content-Type must be application/json",
+                        format!("Unsupported Media Media: Content-Type was '{}', must be application/json, text/plain, or application/octet-stream", content_type),
                     ))
                     .boxed(),
                 )
                 .expect("valid response"));
         }
-
-        // json deserialize request body
-        let (part, body) = request.into_parts();
-        let mut message = match expect_json(body).await {
-            Ok(message) => message,
-            Err(response) => return Ok(response),
+        let mut message = match crate::transport::tsp_utils::parse_message_by_content_type(
+            content_type,
+            body,
+            self.config.manager.clone(),
+            &part,
+        )
+        .await
+        {
+            Ok(msg) => msg,
+            Err(response) => {
+                return Ok(response);
+            }
         };
 
         if self.config.stateful_mode {
@@ -290,10 +301,10 @@ where
                 // inject request part to extensions
                 match &mut message {
                     ClientJsonRpcMessage::Request(req) => {
-                        req.request.extensions_mut().insert(part);
+                        req.request.extensions_mut().insert(part.clone());
                     }
                     ClientJsonRpcMessage::Notification(not) => {
-                        not.notification.extensions_mut().insert(part);
+                        not.notification.extensions_mut().insert(part.clone());
                     }
                     _ => {
                         // skip
@@ -302,11 +313,33 @@ where
 
                 match message {
                     ClientJsonRpcMessage::Request(_) => {
+                        let client_did = get_client_did(&part);
+                        let tmcp = if let Some(manager) = self.config.manager.clone() {
+                            manager.get_connection(&client_did).await.ok()
+                        } else {
+                            None
+                        };
                         let stream = self
                             .session_manager
                             .create_stream(&session_id, message)
                             .await
-                            .map_err(internal_error_response("get session"))?;
+                            .map_err(internal_error_response("get session"))?
+                            .map(move |msg| {
+                                let msg_str = msg.message.as_ref();
+                                if let Some(tmcp) = &tmcp {
+                                    let sealed =
+                                        tmcp.seal_message(msg_str).unwrap_or(msg_str.to_string());
+                                    ServerSseMessage {
+                                        event_id: msg.event_id.clone(),
+                                        message: Arc::new(sealed),
+                                    }
+                                } else {
+                                    ServerSseMessage {
+                                        event_id: msg.event_id.clone(),
+                                        message: Arc::new(msg_str.to_string()),
+                                    }
+                                }
+                            });
                         Ok(sse_stream_response(stream, self.config.sse_keep_alive))
                     }
                     ClientJsonRpcMessage::Notification(_)
@@ -332,12 +365,19 @@ where
                     .create_session()
                     .await
                     .map_err(internal_error_response("create session"))?;
+                let client_did = get_client_did(&part);
+                let mut _tmcp_connection = None;
+                if let (Some(manager), false) = (&self.config.manager, client_did.is_empty()) {
+                    if let Ok(conn) = manager.get_connection(&client_did).await {
+                        _tmcp_connection = Some(conn);
+                    }
+                }
                 if let ClientJsonRpcMessage::Request(req) = &mut message {
                     if !matches!(req.request, ClientRequest::InitializeRequest(_)) {
                         return Err(unexpected_message_response("initialize request"));
                     }
                     // inject request part to extensions
-                    req.request.extensions_mut().insert(part);
+                    req.request.extensions_mut().insert(part.clone());
                 } else {
                     return Err(unexpected_message_response("initialize request"));
                 }
@@ -376,17 +416,51 @@ where
                     .initialize_session(&session_id, message)
                     .await
                     .map_err(internal_error_response("create stream"))?;
-                let mut response = sse_stream_response(
-                    futures::stream::once({
-                        async move {
-                            ServerSseMessage {
-                                event_id: None,
-                                message: response.into(),
+                let keep_alive = self.config.sse_keep_alive;
+                let mut response = if let Some(manager) = &self.config.manager {
+                    let client_did = get_client_did(&part);
+                    match manager.get_connection(&client_did).await {
+                        Ok(tmcp) => sse_stream_response(
+                            futures::stream::once({
+                                let tmcp = tmcp.clone();
+                                async move {
+                                    let msg_json = serde_json::to_string(&response).unwrap();
+                                    let sealed = tmcp.seal_message(&msg_json).unwrap_or(msg_json);
+                                    ServerSseMessage {
+                                        event_id: None,
+                                        message: Arc::new(sealed),
+                                    }
+                                }
+                            }),
+                            keep_alive,
+                        ),
+                        Err(_) => sse_stream_response(
+                            futures::stream::once({
+                                async move {
+                                    let msg_json = serde_json::to_string(&response).unwrap();
+                                    ServerSseMessage {
+                                        event_id: None,
+                                        message: Arc::new(msg_json),
+                                    }
+                                }
+                            }),
+                            keep_alive,
+                        ),
+                    }
+                } else {
+                    sse_stream_response(
+                        futures::stream::once({
+                            async move {
+                                let msg_json = serde_json::to_string(&response).unwrap();
+                                ServerSseMessage {
+                                    event_id: None,
+                                    message: Arc::new(msg_json),
+                                }
                             }
-                        }
-                    }),
-                    self.config.sse_keep_alive,
-                );
+                        }),
+                        keep_alive,
+                    )
+                };
 
                 response.headers_mut().insert(
                     HEADER_SESSION_ID,
@@ -410,12 +484,27 @@ where
                         // on service created
                         let _ = service.waiting().await;
                     });
+                    let tmcp = if let Some(manager) = self.config.manager.clone() {
+                        manager.get_connection("").await.ok()
+                    } else {
+                        None
+                    };
                     Ok(sse_stream_response(
-                        ReceiverStream::new(receiver).map(|message| {
+                        ReceiverStream::new(receiver).map(move |message| {
                             tracing::info!(?message);
-                            ServerSseMessage {
-                                event_id: None,
-                                message: message.into(),
+                            let msg_json = serde_json::to_string(&message).unwrap();
+                            if let Some(tmcp) = &tmcp {
+                                let sealed =
+                                    tmcp.seal_message(&msg_json).unwrap_or(msg_json.clone());
+                                ServerSseMessage {
+                                    event_id: None,
+                                    message: Arc::new(sealed),
+                                }
+                            } else {
+                                ServerSseMessage {
+                                    event_id: None,
+                                    message: Arc::new(msg_json),
+                                }
                             }
                         }),
                         self.config.sse_keep_alive,
@@ -423,7 +512,20 @@ where
                 }
                 ClientJsonRpcMessage::Notification(_notification) => {
                     // ignore
-                    Ok(accepted_response())
+                    if let Some(manager) = &self.config.manager {
+                        let resp = accepted_response();
+                        let body_str = "Accepted";
+                        let sealed = match manager.get_connection("").await {
+                            Ok(tmcp) => tmcp.seal_message(body_str).unwrap_or(body_str.to_string()),
+                            Err(_) => body_str.to_string(),
+                        };
+                        Ok(Response::builder()
+                            .status(resp.status())
+                            .body(Full::new(Bytes::from(sealed)).boxed())
+                            .expect("valid response"))
+                    } else {
+                        Ok(accepted_response())
+                    }
                 }
                 ClientJsonRpcMessage::Response(_json_rpc_response) => Ok(accepted_response()),
                 ClientJsonRpcMessage::Error(_json_rpc_error) => Ok(accepted_response()),

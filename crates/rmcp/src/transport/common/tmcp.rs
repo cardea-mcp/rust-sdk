@@ -39,6 +39,14 @@ pub struct TmcpIdentityManager {
     pub did: String,
 }
 
+impl std::fmt::Debug for TmcpIdentityManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TmcpIdentityManager")
+            .field("did", &self.did)
+            .finish()
+    }
+}
+
 impl Clone for TmcpIdentityManager {
     fn clone(&self) -> Self {
         Self {
@@ -50,9 +58,62 @@ impl Clone for TmcpIdentityManager {
 }
 
 impl TmcpIdentityManager {
+    pub fn get_did(&self) -> &str {
+        &self.did
+    }
+
+    pub fn add_verified_vid(&self, vid: tsp_sdk::Vid) -> anyhow::Result<()> {
+        self.wallet.add_verified_vid(vid, None)?;
+        Ok(())
+    }
+
+    pub fn get_sender_receiver(&self, msg: &[u8]) -> anyhow::Result<(String, String)> {
+        let mut binding = msg.to_vec();
+        match self.wallet.open_message(&mut binding) {
+            Ok(received) => {
+                tracing::info!("get_sender_receiver: ReceivedTspMessage = {:?}", received);
+                let sender = match &received {
+                    ReceivedTspMessage::GenericMessage { sender, .. } => sender.clone(),
+                    ReceivedTspMessage::RequestRelationship { sender, .. } => sender.clone(),
+                    ReceivedTspMessage::AcceptRelationship { sender, .. } => sender.clone(),
+                    ReceivedTspMessage::CancelRelationship { sender, .. } => sender.clone(),
+                    ReceivedTspMessage::ForwardRequest { sender, .. } => sender.clone(),
+                    ReceivedTspMessage::NewIdentifier { sender, .. } => sender.clone(),
+                    ReceivedTspMessage::Referral { sender, .. } => sender.clone(),
+                    ReceivedTspMessage::PendingMessage { .. } => {
+                        return Err(anyhow::anyhow!("PendingMessage variant not supported"));
+                    }
+                };
+                let receiver = match &received {
+                    ReceivedTspMessage::GenericMessage { receiver, .. } => {
+                        receiver.clone().unwrap_or_default()
+                    }
+                    ReceivedTspMessage::RequestRelationship { receiver, .. } => receiver.clone(),
+                    ReceivedTspMessage::AcceptRelationship { receiver, .. } => receiver.clone(),
+                    ReceivedTspMessage::CancelRelationship { receiver, .. } => receiver.clone(),
+                    ReceivedTspMessage::ForwardRequest { receiver, .. } => receiver.clone(),
+                    ReceivedTspMessage::NewIdentifier { receiver, .. } => receiver.clone(),
+                    ReceivedTspMessage::Referral { receiver, .. } => receiver.clone(),
+                    ReceivedTspMessage::PendingMessage { .. } => {
+                        return Err(anyhow::anyhow!("PendingMessage variant not supported"));
+                    }
+                };
+                Ok((sender, receiver))
+            }
+            Err(e) => {
+                tracing::error!(
+                    "get_sender_receiver: wallet.open_message error: {:?}, msg (hex): {:02x?}",
+                    e,
+                    msg
+                );
+                Err(e.into())
+            }
+        }
+    }
     pub async fn new(alias: &str, settings: TmcpSettings) -> anyhow::Result<Self> {
         let mut wallet = SecureStore::new();
         let did = Self::init_identity(alias, &settings, &mut wallet).await?;
+        tracing::info!("Create identity: alias = {}, did = {}", alias, did);
 
         Ok(Self {
             settings,
@@ -107,6 +168,11 @@ impl TmcpIdentityManager {
     pub async fn get_connection(&self, other_did: &str) -> anyhow::Result<TmcpConnection> {
         let verified_vid = verify_vid(other_did).await?.0;
         self.wallet.add_verified_vid(verified_vid, None)?;
+        tracing::info!(
+            "Server get_connection: my_did = {}, other_did = {}",
+            self.did,
+            other_did
+        );
 
         Ok(TmcpConnection::new(
             self.wallet.clone(),
@@ -118,7 +184,7 @@ impl TmcpIdentityManager {
 
 #[derive(Clone)]
 pub struct TmcpConnection {
-    wallet: SecureStore,
+    pub wallet: SecureStore,
     my_did: String,
     other_did: String,
 }
@@ -133,6 +199,9 @@ impl std::fmt::Debug for TmcpConnection {
 }
 
 impl TmcpConnection {
+    pub fn my_did(&self) -> &str {
+        &self.my_did
+    }
     pub fn new(wallet: SecureStore, my_did: &str, other_did: &str) -> Self {
         Self {
             wallet,
@@ -153,10 +222,7 @@ impl TmcpConnection {
         tracing::debug!("TmcpConnection.open_message: encoded = {}", encoded);
         let mut tsp_message = match URL_SAFE_NO_PAD.decode(encoded) {
             Ok(msg) => msg,
-            Err(e) => {
-                tracing::error!("TmcpConnection.open_message: base64 decode error = {:?}", e);
-                return Err(anyhow::anyhow!("base64 decode error: {:?}", e));
-            }
+            Err(_) => encoded.as_bytes().to_vec(),
         };
 
         let msg = match self.wallet.open_message(&mut tsp_message) {

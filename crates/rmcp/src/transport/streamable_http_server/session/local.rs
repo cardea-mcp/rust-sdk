@@ -180,25 +180,32 @@ impl std::str::FromStr for EventId {
 }
 
 use super::{ServerSseMessage, SessionManager};
+use crate::transport::common::tmcp::TmcpConnection;
 
 struct CachedTx {
     tx: Sender<ServerSseMessage>,
     cache: VecDeque<ServerSseMessage>,
     http_request_id: Option<HttpRequestId>,
     capacity: usize,
+    tmcp_connection: Option<TmcpConnection>,
 }
 
 impl CachedTx {
-    fn new(tx: Sender<ServerSseMessage>, http_request_id: Option<HttpRequestId>) -> Self {
+    fn new(
+        tx: Sender<ServerSseMessage>,
+        http_request_id: Option<HttpRequestId>,
+        tmcp_connection: Option<TmcpConnection>,
+    ) -> Self {
         Self {
             cache: VecDeque::with_capacity(tx.capacity()),
             capacity: tx.capacity(),
             tx,
             http_request_id,
+            tmcp_connection,
         }
     }
-    fn new_common(tx: Sender<ServerSseMessage>) -> Self {
-        Self::new(tx, None)
+    fn new_common(tx: Sender<ServerSseMessage>, tmcp_connection: Option<TmcpConnection>) -> Self {
+        Self::new(tx, None, tmcp_connection)
     }
 
     async fn send(&mut self, message: ServerJsonRpcMessage) {
@@ -215,9 +222,17 @@ impl CachedTx {
             http_request_id: self.http_request_id,
             index,
         };
+
+        let sealed_json = if let Some(tmcp) = &self.tmcp_connection {
+            tmcp.seal_message(&serde_json::to_string(&message).unwrap())
+                .unwrap_or_else(|_| serde_json::to_string(&message).unwrap())
+        } else {
+            serde_json::to_string(&message).unwrap()
+        };
+
         let message = ServerSseMessage {
             event_id: Some(event_id.to_string()),
-            message: Arc::new(message),
+            message: Arc::new(sealed_json),
         };
         if self.cache.len() >= self.capacity {
             self.cache.pop_front();
@@ -388,7 +403,7 @@ impl LocalSessionWorker {
             http_request_id,
             HttpRequestWise {
                 resources: Default::default(),
-                tx: CachedTx::new(tx, Some(http_request_id)),
+                tx: CachedTx::new(tx, Some(http_request_id), None),
             },
         );
         tracing::debug!(http_request_id, "establish new request wise channel");
@@ -906,7 +921,7 @@ pub fn create_local_session(
     let id = id.into();
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(config.channel_capacity);
     let (common_tx, _) = tokio::sync::mpsc::channel(config.channel_capacity);
-    let common = CachedTx::new_common(common_tx);
+    let common = CachedTx::new_common(common_tx, None);
     tracing::info!(session_id = ?id, "create new session");
     let handle = LocalSessionHandle {
         event_tx,
