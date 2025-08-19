@@ -2,6 +2,10 @@
 <a href="docs/readme/README.zh-cn.md">简体中文(待更新)</a>
 </div>
 
+# [TSP](TSP.md)
+
+This repository extends the official MCP Rust SDK with TSP connection, encryption and decryption capabilities. It follows the practices of the official Python implementation to ensure secure and interoperable communication between Rust and Python MCP over TSP services.
+
 # RMCP
 [![Crates.io Version](https://img.shields.io/crates/v/rmcp)](https://crates.io/crates/rmcp)
 <!-- ![Release status](https://github.com/modelcontextprotocol/rust-sdk/actions/workflows/release.yml/badge.svg) -->
