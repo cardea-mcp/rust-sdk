@@ -3,18 +3,16 @@ use rmcp::transport::streamable_http_server::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod common;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
+use axum::Router;
 use common::counter::Counter;
+use rmcp::transport::common::tmcp::{TmcpIdentityManager, TmcpSettings};
 
 const BIND_ADDRESS: &str = "127.0.0.1:8002";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    use std::sync::Arc;
-
-    use rmcp::transport::common::tmcp::{TmcpIdentityManager, TmcpSettings};
-
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -39,10 +37,7 @@ async fn main() -> anyhow::Result<()> {
         config,
     );
 
-    use axum::Router;
-
     let router = Router::new().fallback_service(service);
-
     let tcp_listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
     println!("Using existing DID: {}", manager.get_did());
     println!(

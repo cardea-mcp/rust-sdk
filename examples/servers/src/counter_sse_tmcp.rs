@@ -1,13 +1,15 @@
 use rmcp::transport::sse_server::{SseServer, SseServerConfig};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod common;
+use std::sync::Arc;
+
 use common::counter::Counter;
+use rmcp::transport::common::tmcp::{TmcpIdentityManager, TmcpSettings};
 
 const BIND_ADDRESS: &str = "127.0.0.1:8001";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    use rmcp::transport::common::tmcp::{TmcpIdentityManager, TmcpSettings};
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -17,8 +19,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let mut settings = TmcpSettings::default();
-    settings.transport = format!("sse://{}", BIND_ADDRESS);
-    use std::sync::Arc;
+    settings.transport = format!("sse://{}/sse", BIND_ADDRESS);
     let manager = Arc::new(TmcpIdentityManager::new("counter-demo-server", settings).await?);
     let config = SseServerConfig {
         bind: BIND_ADDRESS.parse()?,
@@ -29,10 +30,7 @@ async fn main() -> anyhow::Result<()> {
         manager: Some(manager.clone()),
     };
 
-    let (sse_server, mut router) = SseServer::new(config);
-    use axum::{response::Redirect, routing::get};
-    router = router.route("/", get(|| async { Redirect::temporary("/sse") }));
-
+    let (sse_server, router) = SseServer::new(config);
     let listener = tokio::net::TcpListener::bind(sse_server.config.bind).await?;
     let ct = sse_server.config.ct.child_token();
 

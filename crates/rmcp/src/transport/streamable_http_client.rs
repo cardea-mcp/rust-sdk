@@ -145,17 +145,12 @@ impl StreamableHttpPostResponse {
 
                 let message = if let Some(conn) = tmcp_connection {
                     tracing::debug!("expect_initialized: entering decode branch");
-                    match conn.open_message(&data) {
-                        Ok(decoded) => {
-                            tracing::debug!("expect_initialized: decoded = {}", decoded);
-                            serde_json::from_str::<ServerJsonRpcMessage>(&decoded)?
-                        }
-                        Err(e) => {
-                            tracing::error!("expect_initialized: decode error = {:?}", e);
-                            tracing::debug!("expect_initialized: fallback data = {}", data);
-                            serde_json::from_str::<ServerJsonRpcMessage>(&data)?
-                        }
-                    }
+                    let decoded = conn.open_message(&data).map_err(|e| {
+                        StreamableHttpError::UnexpectedServerResponse(
+                            format!("decode error: {:?}", e).into(),
+                        )
+                    })?;
+                    serde_json::from_str::<ServerJsonRpcMessage>(&decoded)?
                 } else if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
                     if json.get("event") == Some(&serde_json::Value::String("message".to_string()))
                     {

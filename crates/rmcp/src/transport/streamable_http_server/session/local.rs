@@ -179,6 +179,8 @@ impl std::str::FromStr for EventId {
     }
 }
 
+use std::sync::RwLock;
+
 use super::{ServerSseMessage, SessionManager};
 use crate::transport::common::tmcp::TmcpConnection;
 
@@ -187,14 +189,14 @@ struct CachedTx {
     cache: VecDeque<ServerSseMessage>,
     http_request_id: Option<HttpRequestId>,
     capacity: usize,
-    tmcp_connection: Option<TmcpConnection>,
+    tmcp_connection: Option<Arc<RwLock<TmcpConnection>>>,
 }
 
 impl CachedTx {
     fn new(
         tx: Sender<ServerSseMessage>,
         http_request_id: Option<HttpRequestId>,
-        tmcp_connection: Option<TmcpConnection>,
+        tmcp_connection: Option<Arc<RwLock<TmcpConnection>>>,
     ) -> Self {
         Self {
             cache: VecDeque::with_capacity(tx.capacity()),
@@ -204,11 +206,14 @@ impl CachedTx {
             tmcp_connection,
         }
     }
-    fn new_common(tx: Sender<ServerSseMessage>, tmcp_connection: Option<TmcpConnection>) -> Self {
+    fn new_common(
+        tx: Sender<ServerSseMessage>,
+        tmcp_connection: Option<Arc<RwLock<TmcpConnection>>>,
+    ) -> Self {
         Self::new(tx, None, tmcp_connection)
     }
 
-    async fn send(&mut self, message: ServerJsonRpcMessage) {
+    async fn send(&mut self, message: ServerJsonRpcMessage) -> anyhow::Result<()> {
         let index = self.cache.back().map_or(0, |m| {
             m.event_id
                 .as_deref()
@@ -224,11 +229,13 @@ impl CachedTx {
         };
 
         let sealed_json = if let Some(tmcp) = &self.tmcp_connection {
-            tmcp.seal_message(&serde_json::to_string(&message).unwrap())
-                .unwrap_or_else(|_| serde_json::to_string(&message).unwrap())
+            let tmcp = tmcp
+                .write()
+                .map_err(|e| anyhow::anyhow!("RwLock poisoned: {:?}", e))?;
+            tmcp.seal_message(&serde_json::to_string(&message)?)
         } else {
-            serde_json::to_string(&message).unwrap()
-        };
+            Ok(serde_json::to_string(&message)?)
+        }?;
 
         let message = ServerSseMessage {
             event_id: Some(event_id.to_string()),
@@ -240,10 +247,15 @@ impl CachedTx {
         } else {
             self.cache.push_back(message.clone());
         }
-        let _ = self.tx.send(message).await.inspect_err(|e| {
-            let event_id = &e.0.event_id;
-            tracing::trace!(?event_id, "trying to send message in a closed session")
-        });
+        self.tx
+            .send(message)
+            .await
+            .inspect_err(|e| {
+                let event_id = &e.0.event_id;
+                tracing::trace!(?event_id, "trying to send message in a closed session")
+            })
+            .ok();
+        Ok(())
     }
 
     async fn sync(&mut self, index: usize) -> Result<(), SessionError> {
@@ -497,7 +509,7 @@ impl LocalSessionWorker {
         match outbound_channel {
             OutboundChannel::RequestWise { id, close } => {
                 if let Some(request_wise) = self.tx_router.get_mut(&id) {
-                    request_wise.tx.send(message).await;
+                    let _ = request_wise.tx.send(message).await;
                     if close {
                         self.tx_router.remove(&id);
                     }
@@ -505,7 +517,12 @@ impl LocalSessionWorker {
                     return Err(SessionError::ChannelClosed(Some(id)));
                 }
             }
-            OutboundChannel::Common => self.common.send(message).await,
+            OutboundChannel::Common => self.common.send(message).await.map_err(|e| {
+                SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("tmcp send error: {e}"),
+                ))
+            })?,
         }
         Ok(())
     }

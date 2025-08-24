@@ -7,14 +7,15 @@ use hyper_util::{
     server::conn::auto::Builder,
     service::TowerToHyperService,
 };
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+use rmcp::transport::{
+    common::tmcp::{TmcpIdentityManager, TmcpSettings},
+    streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    use rmcp::transport::common::tmcp::{TmcpIdentityManager, TmcpSettings};
-
     let mut settings = TmcpSettings::default();
     settings.transport = "http://[::1]:8080".to_string();
     let manager = Arc::new(TmcpIdentityManager::new("counter-hyper-demo-server", settings).await?);

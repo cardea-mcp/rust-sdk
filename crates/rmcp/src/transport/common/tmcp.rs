@@ -4,8 +4,6 @@ use tsp_sdk::{OwnedVid, ReceivedTspMessage, SecureStore, VerifiedVid, vid::verif
 use url::Url;
 use uuid::Uuid;
 
-use crate::transport::common::reqwest::tmcp_client::TmcpReqwestClient;
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct TmcpSettings {
     pub did_publish_url: String,
@@ -33,9 +31,11 @@ impl Default for TmcpSettings {
     }
 }
 
+use std::sync::{Arc, RwLock};
+
 pub struct TmcpIdentityManager {
     settings: TmcpSettings,
-    wallet: SecureStore,
+    wallet: Arc<RwLock<SecureStore>>,
     pub did: String,
 }
 
@@ -63,13 +63,13 @@ impl TmcpIdentityManager {
     }
 
     pub fn add_verified_vid(&self, vid: tsp_sdk::Vid) -> anyhow::Result<()> {
-        self.wallet.add_verified_vid(vid, None)?;
+        self.wallet.write().unwrap().add_verified_vid(vid, None)?;
         Ok(())
     }
 
     pub fn get_sender_receiver(&self, msg: &[u8]) -> anyhow::Result<(String, String)> {
         let mut binding = msg.to_vec();
-        match self.wallet.open_message(&mut binding) {
+        match self.wallet.write().unwrap().open_message(&mut binding) {
             Ok(received) => {
                 tracing::info!("get_sender_receiver: ReceivedTspMessage = {:?}", received);
                 let sender = match &received {
@@ -111,8 +111,8 @@ impl TmcpIdentityManager {
         }
     }
     pub async fn new(alias: &str, settings: TmcpSettings) -> anyhow::Result<Self> {
-        let mut wallet = SecureStore::new();
-        let did = Self::init_identity(alias, &settings, &mut wallet).await?;
+        let wallet = Arc::new(RwLock::new(SecureStore::new()));
+        let did = Self::init_identity(alias, &settings, &mut wallet.write().unwrap()).await?;
         tracing::info!("Create identity: alias = {}, did = {}", alias, did);
 
         Ok(Self {
@@ -167,7 +167,10 @@ impl TmcpIdentityManager {
 
     pub async fn get_connection(&self, other_did: &str) -> anyhow::Result<TmcpConnection> {
         let verified_vid = verify_vid(other_did).await?.0;
-        self.wallet.add_verified_vid(verified_vid, None)?;
+        self.wallet
+            .write()
+            .unwrap()
+            .add_verified_vid(verified_vid, None)?;
         tracing::info!(
             "Server get_connection: my_did = {}, other_did = {}",
             self.did,
@@ -184,7 +187,7 @@ impl TmcpIdentityManager {
 
 #[derive(Clone)]
 pub struct TmcpConnection {
-    pub wallet: SecureStore,
+    pub wallet: Arc<RwLock<SecureStore>>,
     my_did: String,
     other_did: String,
 }
@@ -202,7 +205,7 @@ impl TmcpConnection {
     pub fn my_did(&self) -> &str {
         &self.my_did
     }
-    pub fn new(wallet: SecureStore, my_did: &str, other_did: &str) -> Self {
+    pub fn new(wallet: Arc<RwLock<SecureStore>>, my_did: &str, other_did: &str) -> Self {
         Self {
             wallet,
             my_did: my_did.to_string(),
@@ -211,9 +214,13 @@ impl TmcpConnection {
     }
 
     pub fn seal_message(&self, message: &str) -> anyhow::Result<String> {
-        let (_, tsp_message) =
-            self.wallet
-                .seal_message(&self.my_did, &self.other_did, None, message.as_bytes())?;
+        let wallet = self
+            .wallet
+            .write()
+            .map_err(|e| anyhow::anyhow!("RwLock poisoned: {:?}", e))?;
+        let (_, tsp_message) = wallet
+            .seal_message(&self.my_did, &self.other_did, None, message.as_bytes())
+            .map_err(|e| anyhow::anyhow!("seal_message error: {:?}", e))?;
 
         Ok(URL_SAFE_NO_PAD.encode(tsp_message.as_ref() as &[u8]))
     }
@@ -222,19 +229,16 @@ impl TmcpConnection {
         tracing::debug!("TmcpConnection.open_message: encoded = {}", encoded);
         let mut tsp_message = match URL_SAFE_NO_PAD.decode(encoded) {
             Ok(msg) => msg,
-            Err(_) => encoded.as_bytes().to_vec(),
+            Err(e) => return Err(anyhow::anyhow!("base64 decode error: {:?}", e)),
         };
 
-        let msg = match self.wallet.open_message(&mut tsp_message) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!(
-                    "TmcpConnection.open_message: wallet open_message error = {:?}",
-                    e
-                );
-                return Err(anyhow::anyhow!("wallet open_message error: {:?}", e));
-            }
-        };
+        let wallet = self
+            .wallet
+            .write()
+            .map_err(|e| anyhow::anyhow!("RwLock poisoned: {:?}", e))?;
+        let msg = wallet
+            .open_message(&mut tsp_message)
+            .map_err(|e| anyhow::anyhow!("wallet open_message error: {:?}", e))?;
 
         let sender = match &msg {
             ReceivedTspMessage::GenericMessage { sender, .. } => sender.as_str(),
@@ -245,11 +249,11 @@ impl TmcpConnection {
         };
 
         if !sender.is_empty() && sender != self.other_did {
-            tracing::warn!(
+            return Err(anyhow::anyhow!(
                 "Received message from unexpected sender: {} (expected {})",
                 sender,
                 self.other_did
-            );
+            ));
         }
 
         if let ReceivedTspMessage::GenericMessage { message, .. } = msg {
@@ -257,10 +261,6 @@ impl TmcpConnection {
             tracing::debug!("TmcpConnection.open_message: decoded = {}", decoded);
             Ok(decoded)
         } else {
-            tracing::error!(
-                "TmcpConnection.open_message: Expected GenericMessage, got {:?}",
-                msg
-            );
             Err(anyhow::anyhow!("Expected GenericMessage, got {:?}", msg))
         }
     }
@@ -280,19 +280,4 @@ pub async fn resolve_server(server_did: &str, did: Option<&str>) -> anyhow::Resu
     }
 
     Ok(url.to_string())
-}
-
-impl crate::transport::common::TmcpMessageCodec for TmcpReqwestClient {
-    fn seal_message(&self, message: &str) -> anyhow::Result<String> {
-        match &self.tmcp_connection {
-            Some(conn) => conn.seal_message(message),
-            None => Ok(message.to_string()),
-        }
-    }
-    fn open_message(&self, encoded: &str) -> anyhow::Result<String> {
-        match &self.tmcp_connection {
-            Some(conn) => conn.open_message(encoded),
-            None => Ok(encoded.to_string()),
-        }
-    }
 }
