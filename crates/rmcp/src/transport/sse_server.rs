@@ -198,8 +198,11 @@ async fn sse_handler(
                             nested_path.as_deref().map(NestedPath::as_str).unwrap_or("");
                         let endpoint_path =
                             format!("{}{}?did={}", nested_path_str, "/message", client_did);
+                        use crate::transport::tsp_utils::serialize_event;
+
+                        let endpoint_json = serialize_event("endpoint", &endpoint_path);
                         let sealed = tmcp
-                            .seal_message(&endpoint_path)
+                            .seal_message(&endpoint_json)
                             .unwrap_or_else(|_| "seal_message error".to_string());
                         Box::pin(
                             futures::stream::once(futures::future::ok(
@@ -213,9 +216,11 @@ async fn sse_handler(
                                             serde_json::to_string(&message).map_err(|e| {
                                                 io::Error::new(io::ErrorKind::InvalidData, e)
                                             })?;
-                                        let sealed = tmcp.seal_message(&json).map_err(|e| {
-                                            io::Error::new(io::ErrorKind::InvalidData, e)
-                                        })?;
+                                        let message_json = serialize_event("message", &json);
+                                        let sealed =
+                                            tmcp.seal_message(&message_json).map_err(|e| {
+                                                io::Error::new(io::ErrorKind::InvalidData, e)
+                                            })?;
                                         Ok(Event::default().event("message").data(&sealed))
                                     }
                                 }),

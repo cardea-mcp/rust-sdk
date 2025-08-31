@@ -43,6 +43,34 @@ pub fn get_client_did(part: &http::request::Parts) -> String {
     .unwrap_or_default()
 }
 
+pub fn serialize_event(event_type: &str, data: &str) -> String {
+    serde_json::json!({
+        "event": event_type,
+        "data": data
+    })
+    .to_string()
+}
+
+pub fn parse_event(data: &str) -> Option<(String, String)> {
+    match serde_json::from_str::<serde_json::Value>(data) {
+        Ok(json) => {
+            let event_type = json
+                .get("event")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let event_data = json
+                .get("data")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            match (event_type, event_data) {
+                (Some(e), Some(d)) => Some((e, d)),
+                _ => None,
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 pub async fn ensure_tmcp_connection(
     manager: &Arc<TmcpIdentityManager>,
     did: &str,

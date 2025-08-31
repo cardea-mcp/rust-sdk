@@ -5,10 +5,10 @@ use std::{
     time::Duration,
 };
 
-use futures::{Stream, stream::BoxStream};
+use futures::{Future, Stream, stream::BoxStream};
 use sse_stream::{Error as SseError, Sse};
 
-use crate::model::ServerJsonRpcMessage;
+use crate::{model::ServerJsonRpcMessage, transport::tsp_utils::parse_event};
 
 pub type BoxedSseResponse = BoxStream<'static, Result<Sse, SseError>>;
 
@@ -198,35 +198,23 @@ where
                         }
                         if let Some(data) = sse.data {
                             let try_message = if let Some(conn) = &this.tmcp_connection {
-                                match conn.open_message(&data) {
-                                    Ok(decoded) => {
-                                        tracing::debug!("client_side_sse: decoded = {}", decoded);
-                                        serde_json::from_str::<ServerJsonRpcMessage>(&decoded)
+                                let (event_type, event_data) = parse_event(&data)
+                                    .map(|(t, d)| (Some(t), Some(d)))
+                                    .unwrap_or((None, None));
+                                let decoded = match (event_type.as_deref(), event_data.as_deref()) {
+                                    (Some("message"), Some(ed)) => {
+                                        conn.open_message(ed).unwrap_or(ed.to_string())
                                     }
-                                    Err(e) => {
-                                        tracing::error!("client_side_sse: decode error = {:?}", e);
-                                        tracing::debug!(
-                                            "client_side_sse: fallback data = {}",
-                                            data
-                                        );
-                                        serde_json::from_str::<ServerJsonRpcMessage>(&data)
-                                    }
-                                }
-                            } else if let Ok(json) =
-                                serde_json::from_str::<serde_json::Value>(&data)
-                            {
-                                if json.get("event")
-                                    == Some(&serde_json::Value::String("message".to_string()))
-                                {
-                                    if let Some(inner) = json.get("data").and_then(|v| v.as_str()) {
-                                        serde_json::from_str::<ServerJsonRpcMessage>(inner)
-                                    } else {
-                                        Err(serde_json::from_str::<ServerJsonRpcMessage>("null")
-                                            .unwrap_err())
-                                    }
+                                    _ => conn.open_message(&data).unwrap_or(data.to_string()),
+                                };
+                                serde_json::from_str::<ServerJsonRpcMessage>(&decoded)
+                            } else if let Some((event_type, event_data)) = parse_event(&data) {
+                                let msg_data = if event_type == "message" {
+                                    event_data
                                 } else {
-                                    serde_json::from_value::<ServerJsonRpcMessage>(json)
-                                }
+                                    data.clone()
+                                };
+                                serde_json::from_str::<ServerJsonRpcMessage>(&msg_data)
                             } else {
                                 serde_json::from_str::<ServerJsonRpcMessage>(&data)
                             };

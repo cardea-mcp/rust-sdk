@@ -325,18 +325,20 @@ where
                             .await
                             .map_err(internal_error_response("get session"))?
                             .map(move |msg| {
-                                let msg_str = msg.message.as_ref();
                                 if let Some(tmcp) = &tmcp {
-                                    let sealed =
-                                        tmcp.seal_message(msg_str).unwrap_or(msg_str.to_string());
+                                    let sealed = tmcp
+                                        .seal_message(msg.message.as_ref())
+                                        .unwrap_or_else(|_| msg.message.as_ref().to_string());
+                                    use crate::transport::tsp_utils::serialize_event;
+                                    let event_json = serialize_event("message", &sealed);
                                     ServerSseMessage {
                                         event_id: msg.event_id.clone(),
-                                        message: Arc::new(sealed),
+                                        message: Arc::new(event_json),
                                     }
                                 } else {
                                     ServerSseMessage {
                                         event_id: msg.event_id.clone(),
-                                        message: Arc::new(msg_str.to_string()),
+                                        message: Arc::new(msg.message.as_ref().to_string()),
                                     }
                                 }
                             });

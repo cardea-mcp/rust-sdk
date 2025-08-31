@@ -15,6 +15,7 @@ use crate::{
             },
         },
         streamable_http_client::*,
+        tsp_utils::parse_event,
     },
 };
 
@@ -77,10 +78,36 @@ impl StreamableHttpClient for TmcpReqwestClient {
                                     };
                                     match client.open_message(data) {
                                         Ok(opened) => {
-                                            sse.data = Some(opened);
+                                            if let Some((event_type, event_data)) =
+                                                parse_event(&opened)
+                                            {
+                                                if event_type == "message" {
+                                                    sse.data = Some(event_data);
+                                                } else {
+                                                    sse.data = Some(opened);
+                                                }
+                                            } else {
+                                                sse.data = Some(opened);
+                                            }
                                             Some(Ok(sse))
                                         }
-                                        Err(_) => Some(Ok(sse)),
+                                        Err(_) => {
+                                            if let Some((event_type, event_data)) =
+                                                parse_event(data)
+                                            {
+                                                if event_type == "message" {
+                                                    match client.open_message(&event_data) {
+                                                        Ok(decrypted) => sse.data = Some(decrypted),
+                                                        Err(_) => sse.data = Some(event_data),
+                                                    }
+                                                } else {
+                                                    sse.data = Some(data.to_string());
+                                                }
+                                            } else {
+                                                sse.data = Some(data.to_string());
+                                            }
+                                            Some(Ok(sse))
+                                        }
                                     }
                                 } else {
                                     Some(Ok(sse))

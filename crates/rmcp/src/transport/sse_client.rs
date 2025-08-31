@@ -230,21 +230,38 @@ impl<C: SseClient> SseClientTransport<C> {
                     .next()
                     .await
                     .ok_or(SseTransportError::UnexpectedEndOfStream)??;
-                if let Some("endpoint") = sse.event.as_deref() {
-                    let ep = sse.data.unwrap_or_default();
-                    break message_endpoint(sse_endpoint.clone(), ep)?;
-                }
-                if let (Some("message"), Some(data_str)) = (sse.event.as_deref(), &sse.data) {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
-                        if json.get("event")
-                            == Some(&serde_json::Value::String("endpoint".to_string()))
+                let raw_data = sse.data.clone().unwrap_or_default();
+                use crate::transport::tsp_utils::parse_event;
+                if let Some((event_type, event_data)) = parse_event(&raw_data) {
+                    tracing::info!(
+                        "SSE transport received event: {}, data: {}",
+                        event_type,
+                        event_data
+                    );
+                    if event_type == "endpoint" {
+                        let ep = event_data;
+                        let base_url = sse_endpoint.to_string();
+                        let endpoint_url = match url::Url::parse(&base_url)
+                            .and_then(|base| url::Url::parse(&base.join(&ep).unwrap().to_string()))
                         {
-                            let ep = json
-                                .get("data")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default();
-                            break message_endpoint(sse_endpoint.clone(), ep.to_string())?;
+                            Ok(url) => url,
+                            Err(_) => {
+                                eprintln!("endpoint url parse error");
+                                return Err(SseTransportError::UnexpectedEndOfStream);
+                            }
+                        };
+                        let base_parsed = url::Url::parse(&base_url).unwrap();
+                        if base_parsed.scheme() != endpoint_url.scheme()
+                            || base_parsed.host_str() != endpoint_url.host_str()
+                        {
+                            eprintln!("Endpoint origin mismatch: {}", endpoint_url);
+                            return Err(SseTransportError::UnexpectedEndOfStream);
                         }
+                        break message_endpoint(sse_endpoint.clone(), ep)?;
+                    }
+                } else {
+                    if let Some(ep) = sse.data.clone() {
+                        break message_endpoint(sse_endpoint.clone(), ep)?;
                     }
                 }
                 continue;

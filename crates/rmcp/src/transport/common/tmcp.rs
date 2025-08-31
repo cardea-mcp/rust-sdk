@@ -1,3 +1,4 @@
+use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use tsp_sdk::{OwnedVid, ReceivedTspMessage, SecureStore, VerifiedVid, vid::verify_vid};
@@ -34,8 +35,8 @@ impl Default for TmcpSettings {
 use std::sync::{Arc, RwLock};
 
 pub struct TmcpIdentityManager {
-    settings: TmcpSettings,
-    wallet: Arc<RwLock<SecureStore>>,
+    pub settings: TmcpSettings,
+    pub wallet: Arc<RwLock<SecureStore>>,
     pub did: String,
 }
 
@@ -69,46 +70,37 @@ impl TmcpIdentityManager {
 
     pub fn get_sender_receiver(&self, msg: &[u8]) -> anyhow::Result<(String, String)> {
         let mut binding = msg.to_vec();
-        match self.wallet.write().unwrap().open_message(&mut binding) {
-            Ok(received) => {
-                tracing::info!("get_sender_receiver: ReceivedTspMessage = {:?}", received);
-                let sender = match &received {
-                    ReceivedTspMessage::GenericMessage { sender, .. } => sender.clone(),
-                    ReceivedTspMessage::RequestRelationship { sender, .. } => sender.clone(),
-                    ReceivedTspMessage::AcceptRelationship { sender, .. } => sender.clone(),
-                    ReceivedTspMessage::CancelRelationship { sender, .. } => sender.clone(),
-                    ReceivedTspMessage::ForwardRequest { sender, .. } => sender.clone(),
-                    ReceivedTspMessage::NewIdentifier { sender, .. } => sender.clone(),
-                    ReceivedTspMessage::Referral { sender, .. } => sender.clone(),
-                    ReceivedTspMessage::PendingMessage { .. } => {
-                        return Err(anyhow::anyhow!("PendingMessage variant not supported"));
-                    }
-                };
-                let receiver = match &received {
-                    ReceivedTspMessage::GenericMessage { receiver, .. } => {
-                        receiver.clone().unwrap_or_default()
-                    }
-                    ReceivedTspMessage::RequestRelationship { receiver, .. } => receiver.clone(),
-                    ReceivedTspMessage::AcceptRelationship { receiver, .. } => receiver.clone(),
-                    ReceivedTspMessage::CancelRelationship { receiver, .. } => receiver.clone(),
-                    ReceivedTspMessage::ForwardRequest { receiver, .. } => receiver.clone(),
-                    ReceivedTspMessage::NewIdentifier { receiver, .. } => receiver.clone(),
-                    ReceivedTspMessage::Referral { receiver, .. } => receiver.clone(),
-                    ReceivedTspMessage::PendingMessage { .. } => {
-                        return Err(anyhow::anyhow!("PendingMessage variant not supported"));
-                    }
-                };
-                Ok((sender, receiver))
+        let received = self
+            .wallet
+            .write()
+            .map_err(|e| anyhow::anyhow!("RwLock poisoned: {:?}", e))?
+            .open_message(&mut binding)
+            .map_err(|e| anyhow::anyhow!("wallet open_message error: {:?}", e))
+            .with_context(|| format!("get_sender_receiver: msg (hex): {:02x?}", msg))?;
+        tracing::info!("get_sender_receiver: ReceivedTspMessage = {:?}", received);
+        let sender = match &received {
+            ReceivedTspMessage::GenericMessage { sender, .. } => sender.clone(),
+            ReceivedTspMessage::RequestRelationship { sender, .. } => sender.clone(),
+            ReceivedTspMessage::AcceptRelationship { sender, .. } => sender.clone(),
+            ReceivedTspMessage::CancelRelationship { sender, .. } => sender.clone(),
+            ReceivedTspMessage::ForwardRequest { sender, .. } => sender.clone(),
+            ReceivedTspMessage::NewIdentifier { sender, .. } => sender.clone(),
+            ReceivedTspMessage::Referral { sender, .. } => sender.clone(),
+            _ => return Err(anyhow::anyhow!("PendingMessage variant not supported")),
+        };
+        let receiver = match &received {
+            ReceivedTspMessage::GenericMessage { receiver, .. } => {
+                receiver.clone().unwrap_or_default()
             }
-            Err(e) => {
-                tracing::error!(
-                    "get_sender_receiver: wallet.open_message error: {:?}, msg (hex): {:02x?}",
-                    e,
-                    msg
-                );
-                Err(e.into())
-            }
-        }
+            ReceivedTspMessage::RequestRelationship { receiver, .. } => receiver.clone(),
+            ReceivedTspMessage::AcceptRelationship { receiver, .. } => receiver.clone(),
+            ReceivedTspMessage::CancelRelationship { receiver, .. } => receiver.clone(),
+            ReceivedTspMessage::ForwardRequest { receiver, .. } => receiver.clone(),
+            ReceivedTspMessage::NewIdentifier { receiver, .. } => receiver.clone(),
+            ReceivedTspMessage::Referral { receiver, .. } => receiver.clone(),
+            _ => return Err(anyhow::anyhow!("PendingMessage variant not supported")),
+        };
+        Ok((sender, receiver))
     }
     pub async fn new(alias: &str, settings: TmcpSettings) -> anyhow::Result<Self> {
         let wallet = Arc::new(RwLock::new(SecureStore::new()));
@@ -220,26 +212,35 @@ impl TmcpConnection {
             .map_err(|e| anyhow::anyhow!("RwLock poisoned: {:?}", e))?;
         let (_, tsp_message) = wallet
             .seal_message(&self.my_did, &self.other_did, None, message.as_bytes())
-            .map_err(|e| anyhow::anyhow!("seal_message error: {:?}", e))?;
-
+            .map_err(|e| anyhow::anyhow!("seal_message error: {:?}", e))
+            .with_context(|| {
+                format!(
+                    "seal_message: my_did={}, other_did={}",
+                    self.my_did, self.other_did
+                )
+            })?;
         Ok(URL_SAFE_NO_PAD.encode(tsp_message.as_ref() as &[u8]))
     }
 
     pub fn open_message(&self, encoded: &str) -> anyhow::Result<String> {
         tracing::debug!("TmcpConnection.open_message: encoded = {}", encoded);
-        let mut tsp_message = match URL_SAFE_NO_PAD.decode(encoded) {
-            Ok(msg) => msg,
-            Err(e) => return Err(anyhow::anyhow!("base64 decode error: {:?}", e)),
-        };
-
+        let mut tsp_message = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|e| anyhow::anyhow!("base64 decode error: {:?}", e))
+            .with_context(|| format!("open_message: encoded={}", encoded))?;
         let wallet = self
             .wallet
             .write()
             .map_err(|e| anyhow::anyhow!("RwLock poisoned: {:?}", e))?;
         let msg = wallet
             .open_message(&mut tsp_message)
-            .map_err(|e| anyhow::anyhow!("wallet open_message error: {:?}", e))?;
-
+            .map_err(|e| anyhow::anyhow!("wallet open_message error: {:?}", e))
+            .with_context(|| {
+                format!(
+                    "open_message: my_did={}, other_did={}",
+                    self.my_did, self.other_did
+                )
+            })?;
         let sender = match &msg {
             ReceivedTspMessage::GenericMessage { sender, .. } => sender.as_str(),
             ReceivedTspMessage::RequestRelationship { sender, .. } => sender.as_str(),
@@ -247,7 +248,6 @@ impl TmcpConnection {
             ReceivedTspMessage::ForwardRequest { .. } => "",
             _ => "",
         };
-
         if !sender.is_empty() && sender != self.other_did {
             return Err(anyhow::anyhow!(
                 "Received message from unexpected sender: {} (expected {})",
@@ -255,7 +255,6 @@ impl TmcpConnection {
                 self.other_did
             ));
         }
-
         if let ReceivedTspMessage::GenericMessage { message, .. } = msg {
             let decoded = String::from_utf8_lossy(message).to_string();
             tracing::debug!("TmcpConnection.open_message: decoded = {}", decoded);
